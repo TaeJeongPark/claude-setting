@@ -33,6 +33,16 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/track-edits.sh\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "Write|Edit",
         "hooks": [
           {
@@ -40,6 +50,30 @@
             "command": "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/format.sh\"",
             "timeout": 60,
             "statusMessage": "포매팅 중..."
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/session-context.sh\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/verify-on-stop.sh\"",
+            "timeout": 900,
+            "statusMessage": "종료 전 검증 중..."
           }
         ]
       }

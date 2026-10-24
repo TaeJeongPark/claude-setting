@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# claude-loop: PLAN.md 의 작업을 headless Claude Code 로 하나씩 처리하는 장기 자율 루프.
+#
+# 매 반복은 새 컨텍스트의 `claude -p` 세션이며, 반복 사이의 기억은 PLAN.md / PROGRESS.md / git 히스토리뿐이다.
+# 정지 조건: 남은 작업 0 · DONE/BLOCKED 신호 · 최대 반복 · 진전 없는 반복 연속 · 누적 비용 상한.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+사용법: claude-loop [옵션]
+
+  --plan FILE           계획 파일 (기본: PLAN.md, 없으면 .claude/loop/PLAN.md)
+  --progress FILE       진행 기록 파일 (기본: 계획 파일 옆 PROGRESS.md)
+  -n, --max-iter N      최대 반복 횟수 (기본 20)
+  --budget USD          반복 1회 비용 상한, claude --max-budget-usd (기본 5)
+  --total-budget USD    누적 비용 상한 (기본 50)
+  --timeout MIN         반복 1회 시간 상한(분) (기본 45)
+  --stall N             진전 없는 반복이 N번 연속이면 정지 (기본 3)
+  --branch NAME         시작 전에 새 브랜치를 만들어 전환
+  --mode MODE           권한 모드: auto | acceptEdits | bypassPermissions (기본 auto)
+  --model MODEL         사용할 모델
+  --prompt FILE         반복 프롬프트 템플릿 (기본: .claude/loop/prompt.md → ~/.claude/loop/prompt.md)
+  --notify CMD          종료 시 실행할 명령. 요약 메시지가 첫 인자로 전달된다
+  --dry-run             첫 반복 프롬프트만 출력하고 끝낸다
+  -h, --help
+
+종료 코드: 0 완료 · 1 오류 · 2 BLOCKED · 3 진전 없음 · 4 비용 상한 · 5 최대 반복 도달
+EOF
+}
+
+die() { echo "claude-loop: $*" >&2; exit 1; }
+
+plan="" progress="" max_iter=20 budget=5 total_budget=50 timeout_min=45 stall_max=3
+branch="" mode="auto" model="" prompt_file="" notify="" dry_run=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --plan) plan="$2"; shift 2 ;;
+    --progress) progress="$2"; shift 2 ;;
+    -n|--max-iter) max_iter="$2"; shift 2 ;;
+    --budget) budget="$2"; shift 2 ;;
+    --total-budget) total_budget="$2"; shift 2 ;;
+    --timeout) timeout_min="$2"; shift 2 ;;
+    --stall) stall_max="$2"; shift 2 ;;
+    --branch) branch="$2"; shift 2 ;;
+    --mode) mode="$2"; shift 2 ;;
+    --model) model="$2"; shift 2 ;;
+    --prompt) prompt_file="$2"; shift 2 ;;
+    --notify) notify="$2"; shift 2 ;;
+    --dry-run) dry_run=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 1 ;;
+  esac
+done
+
+for c in claude git jq timeout; do command -v "$c" >/dev/null || die "$c 명령이 필요합니다."; done
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "git 저장소 안에서 실행하세요."
+cd "$root"
+
+if [ -z "$plan" ]; then
+  if [ -f PLAN.md ]; then plan=PLAN.md; elif [ -f .claude/loop/PLAN.md ]; then plan=.claude/loop/PLAN.md; fi
+fi
+[ -n "$plan" ] && [ -f "$plan" ] || die "계획 파일이 없습니다. ~/.claude/loop/PLAN.template.md 를 복사해 PLAN.md 를 만드세요."
+[ -n "$progress" ] || progress="$(dirname "$plan")/PROGRESS.md"
+[ -f "$progress" ] || printf '# 진행 기록\n\n' >"$progress"
+
+if [ -z "$prompt_file" ]; then
+  for p in .claude/loop/prompt.md "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/loop/prompt.md"; do
+    [ -f "$p" ] && { prompt_file="$p"; break; }
+  done
+fi
+[ -f "$prompt_file" ] || die "프롬프트 템플릿을 찾을 수 없습니다."
+
+remaining() { grep -cE '^\s*- \[ \]' "$plan" || true; }
+[ "$(remaining)" -gt 0 ] || die "$plan 에 남은 작업(- [ ])이 없습니다."
+
+render() { # render <iter>
+  local t
+  t="$(cat "$prompt_file")"
+  t="${t//\{\{ITER\}\}/$1}"
+  t="${t//\{\{MAX\}\}/$max_iter}"
+  t="${t//\{\{PLAN\}\}/$plan}"
+  t="${t//\{\{PROGRESS\}\}/$progress}"
+  t="${t//\{\{REMAINING\}\}/$(remaining)}"
+  t="${t//\{\{DATE\}\}/$(date '+%Y-%m-%d %H:%M')}"
+  printf '%s' "$t"
+}
+
+if [ "$dry_run" -eq 1 ]; then render 1; echo; exit 0; fi
+
+# 안전 조건: 기본 브랜치 금지, 추적 중인 파일에 미커밋 변경 금지(반복별 커밋을 구분하기 위해)
+git diff --quiet && git diff --cached --quiet || die "커밋되지 않은 변경이 있습니다. 커밋하거나 stash 한 뒤 실행하세요."
+if [ -n "$branch" ]; then git switch -c "$branch"; fi
+current="$(git branch --show-current)"
+default="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+default="${default#origin/}"
+case "$current" in
+  ""|main|master|develop|"$default") die "기본/공유 브랜치($current)에서는 실행하지 않습니다. --branch 로 작업 브랜치를 만드세요." ;;
+esac
+
+logdir=".claude/loop/logs/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$logdir"
+grep -qxF '.claude/loop/logs/' .git/info/exclude 2>/dev/null || echo '.claude/loop/logs/' >>.git/info/exclude
+summary="$logdir/summary.tsv"
+printf 'iter\tstatus\texit\tcost_usd\tcommits\tremaining\tseconds\n' >"$summary"
+
+args=(-p --output-format json --permission-mode "$mode" --max-budget-usd "$budget")
+[ -n "$model" ] && args+=(--model "$model")
+
+total=0 stall=0 code=5 reason="최대 반복($max_iter) 도달"
+echo "claude-loop: 브랜치 $current, 계획 $plan (남은 작업 $(remaining)), 로그 $logdir"
+
+for ((i = 1; i <= max_iter; i++)); do
+  head_before="$(git rev-parse HEAD)"
+  plan_before="$(git hash-object "$plan")"
+  start=$SECONDS
+  echo "── 반복 $i/$max_iter 시작 ($(date '+%H:%M:%S'))"
+
+  set +e
+  timeout "${timeout_min}m" claude "${args[@]}" "$(render "$i")" </dev/null >"$logdir/iter-$i.json" 2>"$logdir/iter-$i.err"
+  rc=$?
+  set -e
+
+  result="$(jq -r '.result // ""' "$logdir/iter-$i.json" 2>/dev/null || true)"
+  cost="$(jq -r '(.total_cost_usd // 0) * 10000 | round / 10000' "$logdir/iter-$i.json" 2>/dev/null || echo 0)"
+  total="$(awk -v a="$total" -v b="$cost" 'BEGIN { printf "%.4f", a + b }')"
+  status="$(grep -oE '<loop-status>(CONTINUE|DONE|BLOCKED)</loop-status>' <<<"$result" | tail -n 1 | sed -E 's/<[^>]+>//g')"
+  [ "$rc" -eq 124 ] && status="TIMEOUT"
+  [ -n "$status" ] || status="UNKNOWN"
+  commits="$(git rev-list --count "$head_before"..HEAD)"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$status" "$rc" "$cost" "$commits" "$(remaining)" "$((SECONDS - start))" >>"$summary"
+  echo "   상태 $status · 커밋 $commits · 비용 \$$cost (누적 \$$total) · 남은 작업 $(remaining)"
+
+  if [ "$commits" -gt 0 ] || [ "$(git hash-object "$plan")" != "$plan_before" ]; then stall=0; else stall=$((stall + 1)); fi
+
+  if [ "$status" = "BLOCKED" ]; then code=2; reason="BLOCKED — $progress 확인 필요"; break; fi
+  if [ "$(remaining)" -eq 0 ]; then code=0; reason="모든 작업 완료"; break; fi
+  if [ "$status" = "DONE" ]; then code=0; reason="에이전트가 DONE 보고 (남은 체크박스 $(remaining)개 확인 필요)"; break; fi
+  if [ "$stall" -ge "$stall_max" ]; then code=3; reason="진전 없는 반복 ${stall}회 연속"; break; fi
+  if awk -v t="$total" -v m="$total_budget" 'BEGIN { exit !(t >= m) }'; then code=4; reason="누적 비용 \$$total ≥ 상한 \$$total_budget"; break; fi
+done
+
+msg="claude-loop 종료: $reason · 반복 $((i > max_iter ? max_iter : i))회 · 누적 \$$total · 브랜치 $current"
+echo "$msg"
+echo "요약: $summary"
+[ -n "$notify" ] && $notify "$msg" || true
+exit "$code"

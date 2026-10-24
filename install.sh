@@ -21,10 +21,11 @@ link() {
 
 command -v jq >/dev/null 2>&1 || echo "경고: jq가 없으면 hooks가 동작하지 않습니다. jq를 설치하세요." >&2
 
-mkdir -p "$target_dir/rules" "$target_dir/skills"
+mkdir -p "$target_dir/rules" "$target_dir/skills" "$target_dir/agents"
 link "$repo_dir/global/CLAUDE.md" "$target_dir/CLAUDE.md"
 link "$repo_dir/global/settings.json" "$target_dir/settings.json"
 link "$repo_dir/global/hooks" "$target_dir/hooks"
+link "$repo_dir/global/loop" "$target_dir/loop"
 for rule in "$repo_dir"/global/rules/*.md; do
   link "$rule" "$target_dir/rules/$(basename "$rule")"
 done
@@ -32,6 +33,18 @@ for skill in "$repo_dir"/global/skills/*/; do
   skill="${skill%/}"
   link "$skill" "$target_dir/skills/$(basename "$skill")"
 done
+for agent in "$repo_dir"/global/agents/*.md; do
+  link "$agent" "$target_dir/agents/$(basename "$agent")"
+done
+
+# claude-loop 실행 파일
+bin_dir="${CLAUDE_LOOP_BIN_DIR:-$HOME/.local/bin}"
+mkdir -p "$bin_dir"
+link "$repo_dir/global/loop/claude-loop" "$bin_dir/claude-loop"
+case ":$PATH:" in
+  *":$bin_dir:"*) ;;
+  *) echo "참고: $bin_dir 가 PATH에 없습니다. 셸 설정에 export PATH=\"$bin_dir:\$PATH\" 를 추가하세요." ;;
+esac
 
 if ls "$target_dir"/settings.json.bak.* >/dev/null 2>&1; then
   echo "참고: 기존 settings.json이 백업돼 있습니다. 필요한 개인 설정은 global/settings.json에 옮기세요."
